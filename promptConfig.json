@@ -1,0 +1,4 @@
+{
+  "contextPrompt": "Generate a concise background context for the following podcast transcript segment. Avoid repeating background context from the previous segment:\n\n{{transcript}}\n\nContext:",
+  "mainTopicInstruction": "At the end of your response, on a new line, output 'MAIN_TOPIC:' followed by the most important topic discussed in the segment."
+}
