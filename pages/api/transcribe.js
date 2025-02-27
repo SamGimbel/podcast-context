@@ -59,7 +59,39 @@ async function getContextFromTranscript(transcript) {
   const promptConfig = await getPromptConfig();
   const prompt = promptConfig.contextPrompt.replace("{{transcript}}", transcript) +
     "\n" + promptConfig.mainTopicInstruction;
+  
   try {
+    // First attempt to use Claude if API key is available
+    if (appConfig.ANTHROPIC_API_KEY) {
+      console.log("Using Claude API for context generation");
+      
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-api-key': appConfig.ANTHROPIC_API_KEY,
+          'anthropic-version': '2023-06-01'
+        },
+        body: JSON.stringify({
+          model: 'claude-3-sonnet-20240229',
+          max_tokens: 150,
+          messages: [
+            { role: 'user', content: prompt }
+          ]
+        })
+      });
+      
+      const data = await response.json();
+      
+      if (data.content && data.content[0] && data.content[0].text) {
+        return data.content[0].text.trim();
+      }
+      
+      // If Claude API call failed, fall back to OpenAI
+      console.log("Claude API call failed, falling back to OpenAI");
+    }
+    
+    // Fall back to OpenAI if Claude is unavailable or failed
     const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
@@ -72,6 +104,7 @@ async function getContextFromTranscript(transcript) {
          max_tokens: 150
       })
     });
+    
     const data = await response.json();
     if (data.choices && data.choices[0] && data.choices[0].message) {
       return data.choices[0].message.content.trim();
@@ -103,7 +136,8 @@ async function getWikipediaInfo(topic) {
       const article = wikipediaData.query.search[0];
       return {
         title: article.title,
-        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title)}`
+        url: `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title)}`,
+        snippet: article.snippet.replace(/<\/?[^>]+(>|$)/g, "") // Remove HTML tags
       };
     }
     return null;
@@ -138,6 +172,7 @@ export default async function handler(req, res) {
     res.status(405).json({ error: 'Method not allowed' });
     return;
   }
+  
   try {
     const chunks = [];
     for await (const chunk of req) {
@@ -165,11 +200,16 @@ export default async function handler(req, res) {
       console.log("Main topic repeated; skipping Wikipedia lookup.");
     }
     
+    // Adding timestamp for progressive updates
+    const timestamp = Date.now();
+    
     res.status(200).json({
       transcript,
       context: contextBlock,
       wikipedia: wikipediaInfo,
-      segment: "30-second segment (via Whisper)"
+      segment: "30-second segment (via Whisper)",
+      timestamp,
+      mainTopic
     });
   } catch (err) {
     console.error("Transcription error:", err);

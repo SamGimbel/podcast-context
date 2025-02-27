@@ -1,0 +1,136 @@
+<!-- public/sse-test.html -->
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SSE Test</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    #logs {
+      background-color: #f5f5f5;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      padding: 10px;
+      max-height: 400px;
+      overflow-y: auto;
+      margin-top: 20px;
+      font-family: monospace;
+    }
+    .log-entry {
+      margin-bottom: 5px;
+      border-bottom: 1px solid #eee;
+      padding-bottom: 5px;
+    }
+    button, input {
+      padding: 8px 12px;
+      margin-right: 10px;
+    }
+    input {
+      width: 400px;
+    }
+  </style>
+</head>
+<body>
+  <h1>SSE Connection Test</h1>
+  
+  <div>
+    <input 
+      type="text" 
+      id="urlInput" 
+      placeholder="Enter podcast URL" 
+      value="https://www.podtrac.com/pts/redirect.mp3/dovetail.prxu.org/7057/732fbbee-6547-4ed9-997d-3fd77ddc05db/darknet-diaries-ep154-hijacked-line.mp3"
+    >
+    <button id="startBtn">Start SSE Connection</button>
+    <button id="stopBtn">Stop Connection</button>
+  </div>
+  
+  <div id="logs"></div>
+  
+  <script>
+    const logs = document.getElementById('logs');
+    const urlInput = document.getElementById('urlInput');
+    const startBtn = document.getElementById('startBtn');
+    const stopBtn = document.getElementById('stopBtn');
+    let eventSource = null;
+    
+    function addLog(message) {
+      const entry = document.createElement('div');
+      entry.className = 'log-entry';
+      entry.textContent = `${new Date().toISOString().substring(11, 19)} - ${message}`;
+      logs.appendChild(entry);
+      logs.scrollTop = logs.scrollHeight;
+    }
+    
+    startBtn.addEventListener('click', () => {
+      const url = urlInput.value.trim();
+      if (!url) {
+        alert('Please enter a URL');
+        return;
+      }
+      
+      // Close existing connection if any
+      if (eventSource) {
+        eventSource.close();
+        addLog('Closed previous connection');
+      }
+      
+      addLog(`Setting up SSE connection to: ${url}`);
+      const encodedUrl = encodeURIComponent(url);
+      const sseUrl = `/api/simple-stream?podcastUrl=${encodedUrl}`;
+      
+      addLog(`Connecting to: ${sseUrl}`);
+      eventSource = new EventSource(sseUrl);
+      
+      eventSource.onopen = () => {
+        addLog('Connection opened');
+      };
+      
+      eventSource.onerror = (event) => {
+        addLog(`Connection error: ${JSON.stringify(event)}`);
+        console.error('SSE error', event);
+      };
+      
+      eventSource.onmessage = (event) => {
+        addLog(`Message received: ${event.data}`);
+        try {
+          const data = JSON.parse(event.data);
+          addLog(`Parsed: ${JSON.stringify(data)}`);
+        } catch (err) {
+          addLog(`Parse error: ${err.message}`);
+        }
+      };
+      
+      // Listen for status events
+      eventSource.addEventListener('status', (event) => {
+        try {
+          const data = JSON.parse(event.data);
+          addLog(`Status update: ${data.status} - ${data.message}`);
+        } catch (err) {
+          addLog(`Status parse error: ${err.message}`);
+        }
+      });
+      
+      addLog('EventSource setup complete');
+    });
+    
+    stopBtn.addEventListener('click', () => {
+      if (eventSource) {
+        eventSource.close();
+        eventSource = null;
+        addLog('Connection closed manually');
+      } else {
+        addLog('No active connection to close');
+      }
+    });
+    
+    // Initial log
+    addLog('Page loaded. Click "Start SSE Connection" to begin testing.');
+  </script>
+</body>
+</html>
