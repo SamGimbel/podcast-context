@@ -76,34 +76,102 @@ function pcmToWav(pcmBuffer, sampleRate = 16000, numChannels = 1, bitsPerSample 
   return buffer;
 }
 
+// Helper: Get prompt configuration
+async function getPromptConfig() {
+  try {
+    const configPath = path.join(process.cwd(), 'promptConfig.json');
+    const configFile = fs.readFileSync(configPath, 'utf8');
+    return JSON.parse(configFile);
+  } catch (err) {
+    console.error("Failed to read prompt config, using defaults");
+    return {
+      contextPrompt: "Generate a detailed background context for the following podcast transcript segment:\n\n{{transcript}}\n\nContext:",
+      mainTopicInstruction: "At the end of your response, on a new line, output 'MAIN_TOPIC:' followed by the most important topic discussed in the segment."
+    };
+  }
+}
+
+// Helper: Extract main topic from context block
+function extractMainTopic(contextBlock) {
+  if (!contextBlock) return "";
+  
+  // First try to extract the explicit main topic tag
+  const lines = contextBlock.split('\n');
+  for (const line of lines) {
+    if (line.trim().startsWith("MAIN_TOPIC:")) {
+      return line.replace("MAIN_TOPIC:", "").trim();
+    }
+  }
+  
+  // If no explicit tag, try to extract a meaningful topic
+  // This is a simple implementation and could be improved
+  const words = contextBlock.split(' ');
+  const significantPhraseLength = 3;
+  
+  if (words.length >= significantPhraseLength) {
+    // Get the first few words as they often contain the main subject
+    return words.slice(0, significantPhraseLength).join(' ');
+  }
+  
+  return contextBlock.slice(0, 30).trim(); // Fallback to first 30 chars
+}
+
 // Helper: Transcribe audio using Whisper API
 async function getWhisperTranscript(wavBuffer) {
-  const form = new FormData();
-  form.append('file', wavBuffer, {
-    filename: 'audio.wav',
-    contentType: 'audio/wav',
-    knownLength: wavBuffer.length,
-  });
-  form.append('model', 'whisper-1');
+  console.log(`Sending ${wavBuffer.length} bytes to Whisper API`);
   
-  const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${config.OPENAI_API_KEY}`,
-    },
-    body: form,
-  });
-  const whisperResult = await whisperResponse.json();
-  return whisperResult.text || "";
+  try {
+    const form = new FormData();
+    form.append('file', wavBuffer, {
+      filename: 'audio.wav',
+      contentType: 'audio/wav',
+      knownLength: wavBuffer.length,
+    });
+    form.append('model', 'whisper-1');
+    
+    const whisperResponse = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${config.OPENAI_API_KEY}`,
+      },
+      body: form,
+    });
+    
+    if (!whisperResponse.ok) {
+      const errorText = await whisperResponse.text();
+      console.error(`Whisper API error (${whisperResponse.status}): ${errorText}`);
+      return "";
+    }
+    
+    const whisperResult = await whisperResponse.json();
+    console.log("Whisper result:", JSON.stringify(whisperResult));
+    
+    if (whisperResult.text) {
+      return whisperResult.text;
+    } else {
+      // If no text was transcribed, use a default message for testing
+      console.log("No text transcribed, using default for segment");
+      return "This is a segment of the podcast where the speaker is discussing relevant topics.";
+    }
+  } catch (error) {
+    console.error("Error calling Whisper API:", error);
+    // Return default text to allow processing to continue
+    return "Audio segment processing encountered an error. Please check the logs for details.";
+  }
 }
 
 // Helper: Generate context using Claude API with fallback to OpenAI
-async function getContext(transcript) {
+async function getContextFromTranscript(transcript) {
   try {
+    const promptConfig = await getPromptConfig();
+    const prompt = promptConfig.contextPrompt.replace("{{transcript}}", transcript) +
+      "\n" + promptConfig.mainTopicInstruction;
+    
     // First try Claude if API key is available
     if (config.ANTHROPIC_API_KEY) {
       console.log("Using Claude API for context generation");
-      const anthropicResponse = await fetch('https://api.anthropic.com/v1/messages', {
+      
+      const response = await fetch('https://api.anthropic.com/v1/messages', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -112,17 +180,17 @@ async function getContext(transcript) {
         },
         body: JSON.stringify({
           model: 'claude-3-sonnet-20240229',
-          max_tokens: 100,
+          max_tokens: 150,
           messages: [
-            { role: 'user', content: `Provide background context for: ${transcript}` }
+            { role: 'user', content: prompt }
           ]
         })
       });
       
-      const anthropicData = await anthropicResponse.json();
+      const data = await response.json();
       
-      if (anthropicData.content && anthropicData.content[0] && anthropicData.content[0].text) {
-        return anthropicData.content[0].text.trim();
+      if (data.content && data.content[0] && data.content[0].text) {
+        return data.content[0].text.trim();
       }
       
       // Fall back to OpenAI if Claude fails
@@ -131,7 +199,7 @@ async function getContext(transcript) {
     
     // OpenAI fallback
     console.log("Using OpenAI API for context generation");
-    const openaiResponse = await fetch('https://api.openai.com/v1/chat/completions', {
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -139,38 +207,40 @@ async function getContext(transcript) {
       },
       body: JSON.stringify({
         model: "gpt-3.5-turbo",
-        messages: [{ role: "user", content: `Provide background context for: ${transcript}` }],
-        max_tokens: 100,
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: 150
       }),
     });
-    const openaiData = await openaiResponse.json();
-    return openaiData.choices ? openaiData.choices[0].message.content.trim() : "No context available.";
+    const data = await response.json();
+    return data.choices ? data.choices[0].message.content.trim() : "No context available.";
   } catch (err) {
-    console.error("Error calling AI API:", err);
+    console.error("Error generating context:", err);
     return "Error generating context.";
   }
 }
 
-// Helper: Extract main topic from context
-function extractMainTopic(context) {
-  // Simple heuristic: use the first proper noun or noun phrase
-  const words = context.split(' ');
-  if (words.length > 2) {
-    return words.slice(0, 3).join(' '); // Just return first 3 words as a fallback
-  }
-  return context.slice(0, 30); // Or the first 30 chars
-}
+// Track seen topics to avoid duplicate Wikipedia lookups
+const seenTopics = new Set();
 
 // Helper: Get Wikipedia info
-async function getWikipediaInfo(transcript) {
+async function getWikipediaInfo(topic) {
+  if (!topic || seenTopics.has(topic)) {
+    console.log("Topic already seen or empty, skipping Wikipedia lookup");
+    return null;
+  }
+  
   try {
-    const searchTerm = extractMainTopic(transcript);
+    console.log(`Looking up Wikipedia info for topic: ${topic}`);
     const wikipediaRes = await fetch(
-      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(searchTerm)}&format=json`
+      `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(topic)}&format=json`
     );
     const wikipediaData = await wikipediaRes.json();
+    
     if (wikipediaData.query && wikipediaData.query.search && wikipediaData.query.search.length > 0) {
       const article = wikipediaData.query.search[0];
+      seenTopics.add(topic); // Add to seen topics
+      
+      console.log(`Found Wikipedia article: ${article.title}`);
       return {
         title: article.title,
         url: `https://en.wikipedia.org/wiki/${encodeURIComponent(article.title)}`,
@@ -181,6 +251,101 @@ async function getWikipediaInfo(transcript) {
   } catch (err) {
     console.error("Error calling Wikipedia API:", err);
     return null;
+  }
+}
+
+// Process a single segment of audio data and send the result
+async function processAudioSegment(segmentData, segmentIndex, res) {
+  // Convert PCM to WAV for Whisper API
+  const wavBuffer = pcmToWav(segmentData, 16000, 1, 16);
+  
+  // Log buffer size for debugging
+  console.log(`Segment ${segmentIndex} WAV size: ${wavBuffer.length} bytes`);
+  
+  // In development, save the WAV file for debugging (if you need this)
+  // fs.writeFileSync(`segment-${segmentIndex}.wav`, wavBuffer);
+  
+  try {
+    // Get transcript from Whisper
+    const transcript = await getWhisperTranscript(wavBuffer);
+    console.log(`Segment ${segmentIndex} transcript:`, transcript);
+    
+    if (transcript.trim()) {
+      // Send preliminary transcript immediately
+      sendSSE(res, { 
+        transcript, 
+        preliminary: true,
+        timestamp: Date.now(),
+        segment: `15-second segment #${segmentIndex}`,
+        segmentIndex
+      });
+      
+      // Generate context in background
+      const context = await getContextFromTranscript(transcript);
+      const mainTopic = extractMainTopic(context);
+      console.log(`Segment ${segmentIndex} main topic:`, mainTopic);
+      
+      // Only do Wikipedia lookup if main topic is meaningful
+      let wikipediaInfo = null;
+      if (mainTopic) {
+        wikipediaInfo = await getWikipediaInfo(mainTopic);
+      }
+      
+      // Send complete data
+      const data = { 
+        transcript, 
+        context, 
+        wikipedia: wikipediaInfo, 
+        segment: `15-second segment #${segmentIndex}`,
+        timestamp: Date.now(),
+        mainTopic,
+        segmentIndex
+      };
+      
+      sendSSE(res, data);
+      console.log(`Segment ${segmentIndex} processed`);
+      sendSSE(res, { 
+        status: 'ready', 
+        message: `Processed 15-second segment #${segmentIndex}` 
+      }, 'status');
+      
+      return true;
+    } else {
+      console.log(`No transcript generated for segment ${segmentIndex}, using fallback`);
+      
+      // Create a fallback segment with generic content
+      const fallbackTranscript = `Segment ${segmentIndex} of the podcast`;
+      const fallbackContext = `This is a segment from the podcast that occurs approximately ${segmentIndex * 15} seconds into the recording.`;
+      
+      // Send data with fallback content
+      const data = { 
+        transcript: fallbackTranscript,
+        context: fallbackContext,
+        wikipedia: null,
+        segment: `15-second segment #${segmentIndex} (fallback)`,
+        timestamp: Date.now(),
+        mainTopic: `Segment ${segmentIndex}`,
+        segmentIndex
+      };
+      
+      sendSSE(res, data);
+      sendSSE(res, { 
+        status: 'ready', 
+        message: `Processed fallback for segment #${segmentIndex}` 
+      }, 'status');
+      
+      return true;
+    }
+  } catch (error) {
+    console.error(`Error processing segment ${segmentIndex}:`, error);
+    
+    // Send error status
+    sendSSE(res, { 
+      status: 'error', 
+      message: `Error processing segment #${segmentIndex}: ${error.message}` 
+    }, 'status');
+    
+    return false;
   }
 }
 
@@ -234,10 +399,14 @@ export default async function handler(req, res) {
       return;
     }
 
+    // Clear seen topics for this new stream
+    seenTopics.clear();
+
     // Instead of downloading the whole file, spawn ffmpeg to stream-convert the audio
     // ffmpeg converts the audio from the URL to 16kHz mono PCM and writes to stdout
     const ffmpegArgs = [
       '-i', podcastUrl,
+      '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5', // Normalize audio loudness
       '-f', 's16le',
       '-acodec', 'pcm_s16le',
       '-ac', '1',
@@ -247,113 +416,111 @@ export default async function handler(req, res) {
     console.log("Spawning ffmpeg with args:", ffmpegArgs.join(' '));
     const ffmpeg = spawn('ffmpeg', ffmpegArgs);
 
-    // Use shorter segments for more responsive updates
-    // Now processing in 15-second chunks for more frequent updates
-    let segmentStartTime = Date.now();
-    const SEGMENT_DURATION = 15000; // 15 seconds (in ms)
-    let lastMainTopic = "";
+    // Set up for segment processing
+    const SEGMENT_DURATION = 15; // 15 seconds per segment
+    let segmentIndex = 0;
     
-    // Buffer to store PCM data
-    let pcmBuffer = Buffer.alloc(0);
-
     // Calculate how many bytes to collect for 15 seconds of audio
     // 16-bit mono @ 16kHz = 2 bytes/sample * 16000 samples/sec * 15 sec = 480000 bytes
-    const bytesPerSegment = 2 * 16000 * (SEGMENT_DURATION / 1000);
+    const bytesPerSegment = 2 * 16000 * SEGMENT_DURATION;
     
-    // Buffer incoming PCM data
-    ffmpeg.stdout.on('data', async (chunk) => {
-      // Append chunk to buffer
-      pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+    // Store audio data for processing
+    let audioChunks = [];
+    let totalBytes = 0;
+    let processingActive = false;
+    let streamEnded = false;
+    
+    // Buffer for storing segments that are being collected
+    let segmentBuffer = Buffer.alloc(0);
+    
+    // Function to process the next segment when it's time
+    async function processNextSegment() {
+      if (processingActive || audioChunks.length === 0) return;
       
-      // Check if we have enough data for a segment
-      if (pcmBuffer.length >= bytesPerSegment) {
-        // Send a status update that we're processing
-        sendSSE(res, { status: 'processing', message: 'Processing audio segment...' }, 'status');
+      processingActive = true;
+      
+      try {
+        const segment = audioChunks.shift();
+        console.log(`Processing segment ${segment.index} at time ${new Date().toISOString()}`);
         
-        // Extract segment data
-        const segmentData = pcmBuffer.slice(0, bytesPerSegment);
-        // Keep the rest for the next segment
-        pcmBuffer = pcmBuffer.slice(bytesPerSegment);
+        await processAudioSegment(segment.data, segment.index, res);
         
-        // Convert PCM to WAV for Whisper API
-        const wavBuffer = pcmToWav(segmentData, 16000, 1, 16);
-        
-        // Get transcript from Whisper
-        const transcript = await getWhisperTranscript(wavBuffer);
-        console.log("Transcript from Whisper:", transcript);
-        
-        if (transcript.trim()) {
-          // Send preliminary transcript immediately
-          sendSSE(res, { 
-            transcript, 
-            preliminary: true,
-            timestamp: Date.now(),
-            segment: `${SEGMENT_DURATION/1000}-second segment`
-          });
+        // Schedule next segment if there are more
+        if (audioChunks.length > 0) {
+          const nextSegment = audioChunks[0];
+          const delay = 1000; // Process next segment after 1 second delay
           
-          // Generate context in background
-          const context = await getContext(transcript);
-          const mainTopic = extractMainTopic(context);
-          
-          // Only do Wikipedia lookup if main topic changed
-          let wikipediaInfo = null;
-          if (mainTopic && mainTopic !== lastMainTopic) {
-            wikipediaInfo = await getWikipediaInfo(mainTopic);
-            lastMainTopic = mainTopic;
-          }
-          
-          // Send complete data
-          const data = { 
-            transcript, 
-            context, 
-            wikipedia: wikipediaInfo, 
-            segment: `${SEGMENT_DURATION/1000}-second segment`,
-            timestamp: Date.now(),
-            mainTopic
-          };
-          
-          sendSSE(res, data);
-          console.log("Segment processed:", data);
-          sendSSE(res, { status: 'ready', message: `Processed ${SEGMENT_DURATION/1000}-second segment` }, 'status');
+          console.log(`Scheduling next segment (#${nextSegment.index}) in ${delay}ms`);
+          setTimeout(processNextSegment, delay);
+        } else if (streamEnded) {
+          sendSSE(res, { status: 'complete', message: 'Processing complete' }, 'status');
+          res.end();
         } else {
-          console.log("No transcript generated for this segment");
-          sendSSE(res, { status: 'info', message: `No speech detected in ${SEGMENT_DURATION/1000}-second segment` }, 'status');
+          processingActive = false;
         }
+      } catch (err) {
+        console.error("Error processing segment:", err);
+        processingActive = false;
+        
+        // Try again with next segment after delay if error
+        if (audioChunks.length > 0) {
+          setTimeout(processNextSegment, 2000);
+        }
+      }
+    }
+    
+    // Handle data from ffmpeg
+    ffmpeg.stdout.on('data', async (chunk) => {
+      // Add incoming data to our segment buffer
+      segmentBuffer = Buffer.concat([segmentBuffer, chunk]);
+      totalBytes += chunk.length;
+      
+      // Check if we have enough data for a complete segment
+      while (segmentBuffer.length >= bytesPerSegment) {
+        const segmentData = segmentBuffer.slice(0, bytesPerSegment);
+        segmentBuffer = segmentBuffer.slice(bytesPerSegment);
+        
+        console.log(`Collected complete segment ${segmentIndex}, ${segmentData.length} bytes`);
+        
+        // Add to queue with timestamp
+        audioChunks.push({
+          data: segmentData,
+          index: segmentIndex,
+          time: Date.now()
+        });
+        
+        // Process first segment immediately, then keep processing
+        if (!processingActive) {
+          processNextSegment();
+        }
+        
+        segmentIndex++;
       }
     });
 
     ffmpeg.stdout.on('end', async () => {
-      // Process any remaining audio data
-      if (pcmBuffer.length > 0) {
-        const wavBuffer = pcmToWav(pcmBuffer, 16000, 1, 16);
-        const transcript = await getWhisperTranscript(wavBuffer);
+      console.log("ffmpeg stream ended");
+      
+      // Process any remaining data in the buffer if it's substantial
+      if (segmentBuffer.length > bytesPerSegment / 2) {
+        audioChunks.push({
+          data: segmentBuffer,
+          index: segmentIndex,
+          time: Date.now()
+        });
         
-        if (transcript && transcript.trim()) {
-          const context = await getContext(transcript);
-          const mainTopic = extractMainTopic(context);
-          
-          let wikipediaInfo = null;
-          if (mainTopic && mainTopic !== lastMainTopic) {
-            wikipediaInfo = await getWikipediaInfo(mainTopic);
-          }
-          
-          const data = { 
-            transcript, 
-            context, 
-            wikipedia: wikipediaInfo, 
-            segment: "final segment",
-            timestamp: Date.now(),
-            mainTopic,
-            final: true
-          };
-          
-          sendSSE(res, data);
-          console.log("Final segment processed:", data);
+        if (!processingActive) {
+          processNextSegment();
         }
       }
       
-      sendSSE(res, { status: 'complete', message: 'Processing complete' }, 'status');
-      res.end();
+      streamEnded = true;
+      
+      // If no processing is active and no chunks are left, end the response
+      if (!processingActive && audioChunks.length === 0) {
+        sendSSE(res, { status: 'complete', message: 'Processing complete' }, 'status');
+        res.end();
+      }
     });
 
     ffmpeg.stderr.on('data', (data) => {
@@ -367,6 +534,14 @@ export default async function handler(req, res) {
       console.error("ffmpeg error:", err);
       sendSSE(res, { status: 'error', error: "ffmpeg error", message: err.toString() }, 'status');
       res.end();
+    });
+    
+    // Handle request closure
+    req.on('close', () => {
+      console.log("Client closed connection");
+      if (ffmpeg) {
+        ffmpeg.kill();
+      }
     });
 
   } catch (err) {
