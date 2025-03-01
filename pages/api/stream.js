@@ -256,6 +256,14 @@ async function getWikipediaInfo(topic) {
 
 // Process a single segment of audio data and send the result
 async function processAudioSegment(segmentData, segmentIndex, res) {
+  // Send status update that we're starting to process this segment
+  sendSSE(res, { 
+    status: 'processing', 
+    message: `Processing 15-second segment #${segmentIndex}...` 
+  }, 'status');
+  
+  console.log(`Starting to process segment ${segmentIndex} at ${new Date().toISOString()}`);
+  
   // Convert PCM to WAV for Whisper API
   const wavBuffer = pcmToWav(segmentData, 16000, 1, 16);
   
@@ -267,11 +275,13 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
   
   try {
     // Get transcript from Whisper
+    console.log(`Sending segment ${segmentIndex} to Whisper API`);
     const transcript = await getWhisperTranscript(wavBuffer);
     console.log(`Segment ${segmentIndex} transcript:`, transcript);
     
     if (transcript.trim()) {
       // Send preliminary transcript immediately
+      console.log(`Sending preliminary transcript for segment ${segmentIndex}`);
       sendSSE(res, { 
         transcript, 
         preliminary: true,
@@ -281,6 +291,7 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
       });
       
       // Generate context in background
+      console.log(`Generating context for segment ${segmentIndex}`);
       const context = await getContextFromTranscript(transcript);
       const mainTopic = extractMainTopic(context);
       console.log(`Segment ${segmentIndex} main topic:`, mainTopic);
@@ -288,10 +299,12 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
       // Only do Wikipedia lookup if main topic is meaningful
       let wikipediaInfo = null;
       if (mainTopic) {
+        console.log(`Looking up Wikipedia info for segment ${segmentIndex}`);
         wikipediaInfo = await getWikipediaInfo(mainTopic);
       }
       
       // Send complete data
+      console.log(`Sending complete data for segment ${segmentIndex}`);
       const data = { 
         transcript, 
         context, 
@@ -303,7 +316,7 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
       };
       
       sendSSE(res, data);
-      console.log(`Segment ${segmentIndex} processed`);
+      console.log(`Segment ${segmentIndex} processed successfully`);
       sendSSE(res, { 
         status: 'ready', 
         message: `Processed 15-second segment #${segmentIndex}` 
@@ -329,6 +342,7 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
       };
       
       sendSSE(res, data);
+      console.log(`Sent fallback data for segment ${segmentIndex}`);
       sendSSE(res, { 
         status: 'ready', 
         message: `Processed fallback for segment #${segmentIndex}` 
@@ -344,6 +358,20 @@ async function processAudioSegment(segmentData, segmentIndex, res) {
       status: 'error', 
       message: `Error processing segment #${segmentIndex}: ${error.message}` 
     }, 'status');
+    
+    // Send a fallback segment so the UI still shows something
+    console.log(`Sending error fallback for segment ${segmentIndex}`);
+    const errorFallbackData = {
+      transcript: `[Error processing segment ${segmentIndex}]`,
+      context: `There was an error processing this segment. Please check the logs for details.`,
+      wikipedia: null,
+      segment: `15-second segment #${segmentIndex} (error)`,
+      timestamp: Date.now(),
+      mainTopic: `Error in segment ${segmentIndex}`,
+      segmentIndex
+    };
+    
+    sendSSE(res, errorFallbackData);
     
     return false;
   }
@@ -364,6 +392,12 @@ export default async function handler(req, res) {
     sendSSE(res, { error: 'Missing podcast URL' });
     res.end();
     return;
+  }
+  
+  // Ensure URL has proper protocol
+  if (podcastUrl.startsWith('localhost:')) {
+    podcastUrl = 'http://' + podcastUrl;
+    console.log("Added http:// protocol to localhost URL");
   }
   
   console.log("Processing podcast URL:", podcastUrl);
@@ -405,12 +439,15 @@ export default async function handler(req, res) {
     // Instead of downloading the whole file, spawn ffmpeg to stream-convert the audio
     // ffmpeg converts the audio from the URL to 16kHz mono PCM and writes to stdout
     const ffmpegArgs = [
+      '-re', // Read input at native frame rate (helps with streaming)
       '-i', podcastUrl,
       '-af', 'loudnorm=I=-16:LRA=11:TP=-1.5', // Normalize audio loudness
       '-f', 's16le',
       '-acodec', 'pcm_s16le',
       '-ac', '1',
       '-ar', '16000',
+      '-bufsize', '64k', // Add buffer size to ensure smooth streaming
+      '-flush_packets', '1', // Flush packets more frequently
       '-' // output to stdout
     ];
     console.log("Spawning ffmpeg with args:", ffmpegArgs.join(' '));
@@ -443,7 +480,35 @@ export default async function handler(req, res) {
         const segment = audioChunks.shift();
         console.log(`Processing segment ${segment.index} at time ${new Date().toISOString()}`);
         
-        await processAudioSegment(segment.data, segment.index, res);
+        // Send a status update that we're starting to process this segment
+        sendSSE(res, { 
+          status: 'processing', 
+          message: `Processing 15-second segment #${segment.index}...` 
+        }, 'status');
+        
+        // Process the segment
+        const success = await processAudioSegment(segment.data, segment.index, res);
+        
+        if (!success) {
+          console.log(`Failed to process segment ${segment.index}, sending fallback`);
+          
+          // Send a fallback segment if processing failed
+          const fallbackData = {
+            transcript: `[Segment ${segment.index} processing failed]`,
+            context: `There was an error processing this segment. Please check the logs for details.`,
+            wikipedia: null,
+            segment: `15-second segment #${segment.index} (error)`,
+            timestamp: Date.now(),
+            mainTopic: `Error in segment ${segment.index}`,
+            segmentIndex: segment.index
+          };
+          
+          sendSSE(res, fallbackData);
+          sendSSE(res, { 
+            status: 'ready', 
+            message: `Sent fallback for segment #${segment.index}` 
+          }, 'status');
+        }
         
         // Schedule next segment if there are more
         if (audioChunks.length > 0) {
@@ -475,6 +540,8 @@ export default async function handler(req, res) {
       segmentBuffer = Buffer.concat([segmentBuffer, chunk]);
       totalBytes += chunk.length;
       
+      console.log(`Received ${chunk.length} bytes from ffmpeg, total buffer size: ${segmentBuffer.length}, need ${bytesPerSegment} for a segment`);
+      
       // Check if we have enough data for a complete segment
       while (segmentBuffer.length >= bytesPerSegment) {
         const segmentData = segmentBuffer.slice(0, bytesPerSegment);
@@ -489,9 +556,18 @@ export default async function handler(req, res) {
           time: Date.now()
         });
         
+        // Send a status update that we've collected a segment
+        sendSSE(res, { 
+          status: 'collecting', 
+          message: `Collected 15-second segment #${segmentIndex}, queuing for processing...` 
+        }, 'status');
+        
         // Process first segment immediately, then keep processing
         if (!processingActive) {
+          console.log(`Starting to process segment ${segmentIndex} immediately`);
           processNextSegment();
+        } else {
+          console.log(`Segment ${segmentIndex} queued for processing (waiting for previous segment to complete)`);
         }
         
         segmentIndex++;
@@ -540,7 +616,21 @@ export default async function handler(req, res) {
     req.on('close', () => {
       console.log("Client closed connection");
       if (ffmpeg) {
-        ffmpeg.kill();
+        console.log("Killing ffmpeg process");
+        ffmpeg.kill('SIGKILL'); // Force kill the process
+        
+        // Additional cleanup to ensure process is terminated
+        setTimeout(() => {
+          try {
+            // Check if process is still running and force kill if needed
+            if (ffmpeg.exitCode === null && !ffmpeg.killed) {
+              console.log("ffmpeg process still running, forcing termination");
+              process.kill(ffmpeg.pid, 'SIGKILL');
+            }
+          } catch (err) {
+            console.log("Error during ffmpeg cleanup:", err.message);
+          }
+        }, 500);
       }
     });
 

@@ -37,45 +37,49 @@ export default function useSSEConnection({
     return cleanup;
   }, [cleanup]);
   
-  // Setup debug mode simulation
-  const setupDebugConnection = useCallback((segmentCallback) => {
-    logger('Debug mode: Using simulated SSE connection');
-    
-    // Set initial status
-    if (onStatus) {
-      onStatus({
-        status: 'processing',
-        message: 'Processing in debug mode...'
-      });
-    }
-    
-    let segmentIndex = 0;
-    
-    // Simulate SSE connection with interval
-    const debugInterval = setInterval(() => {
-      const mockData = generateMockData(segmentIndex);
+    // Setup debug mode simulation
+    const setupDebugConnection = useCallback((segmentCallback) => {
+      logger('Debug mode: Using simulated SSE connection');
       
-      // Call segment callback with mock data
-      segmentCallback(mockData);
-      logger(`Debug mode: Generated mock segment ${segmentIndex}`);
+      // Set initial status
+      if (onStatus) {
+        onStatus({
+          status: 'processing',
+          message: 'Processing in debug mode...'
+        });
+      }
       
-      // Increment segment index
-      segmentIndex++;
+      let segmentIndex = 1; // Start from 1 since we already created segment 0 manually
       
-      // Stop after generating some segments
-      if (segmentIndex >= 10) {
-        clearInterval(debugInterval);
+      // Generate first segment immediately
+      logger(`Debug mode: Starting mock data generation`);
+      
+      // Generate segment 1 immediately (segment 0 is created manually in the component)
+      const firstMockData = generateMockData(1);
+      segmentCallback(firstMockData);
+      logger(`Debug mode: Generated first mock segment ${1} immediately`);
+      segmentIndex++; // Increment to 2 for the next interval
+      
+      // Simulate SSE connection with interval for subsequent segments
+      const debugInterval = setInterval(() => {
+        const mockData = generateMockData(segmentIndex);
         
-        if (onStatus) {
+        // Call segment callback with mock data
+        segmentCallback(mockData);
+        logger(`Debug mode: Generated mock segment ${segmentIndex}`);
+        
+        // Increment segment index
+        segmentIndex++;
+        
+        // Continue generating segments indefinitely
+        // We'll let the component handle cleanup when needed
+        if (onStatus && segmentIndex % 5 === 0) {
           onStatus({
-            status: 'ready',
-            message: 'Debug processing complete'
+            status: 'processing',
+            message: `Generated ${segmentIndex} mock segments so far`
           });
         }
-        
-        logger('Debug mode: Finished generating mock segments');
-      }
-    }, 15000); // Every 15 seconds
+      }, 5000); // Every 5 seconds for testing (normally 15000 for 15 seconds)
     
     debugIntervalRef.current = debugInterval;
     
@@ -201,13 +205,43 @@ export default function useSSEConnection({
   const startConnection = useCallback((url, segmentCallback) => {
     // Use debug mode if enabled
     if (debugMode) {
-      eventSourceRef.current = setupDebugConnection(segmentCallback);
+      logger("Starting debug mode connection with mock data");
+      const mockEventSource = setupDebugConnection(segmentCallback);
+      eventSourceRef.current = mockEventSource;
+      
+      // Log that we've set up the connection
+      logger("Debug mode connection established");
+      
+      // Return a function that can be called to clean up
+      return function cleanupDebugConnection() {
+        logger("Cleaning up debug mode connection");
+        if (mockEventSource && mockEventSource.close) {
+          mockEventSource.close();
+        }
+        if (debugIntervalRef.current) {
+          clearInterval(debugIntervalRef.current);
+          debugIntervalRef.current = null;
+          logger('Debug interval cleared');
+        }
+      };
     } else {
-      eventSourceRef.current = setupSSEConnection(url, segmentCallback);
+      logger("Starting real SSE connection");
+      const eventSource = setupSSEConnection(url, segmentCallback);
+      eventSourceRef.current = eventSource;
+      
+      // Log that we've set up the connection
+      logger("Real SSE connection established");
+      
+      // Return a function that can be called to clean up
+      return function cleanupRealConnection() {
+        logger("Cleaning up real SSE connection");
+        if (eventSource) {
+          eventSource.close();
+          logger('SSE connection closed');
+        }
+      };
     }
-    
-    return () => cleanup();
-  }, [debugMode, cleanup, setupDebugConnection, setupSSEConnection]);
+  }, [debugMode, setupDebugConnection, setupSSEConnection, logger]);
   
   // Stop SSE connection
   const stopConnection = useCallback(() => {
